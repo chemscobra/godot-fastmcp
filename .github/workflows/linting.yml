@@ -1,4 +1,4 @@
-name: Example
+name: Linting Workflow
 
 jobs:
   uv-example:
