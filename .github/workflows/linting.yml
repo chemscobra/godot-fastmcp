@@ -1,4 +1,10 @@
-name: Example
+name: Linting Workflow
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
 
 jobs:
   uv-example:
