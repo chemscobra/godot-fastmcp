@@ -1,7 +1,13 @@
 [project]
-  name = "godot-mcp"
-  version = "0.1.0"
-  description = "Add your description here"
-  readme = "README.md"
-  requires-python = ">=3.12"
-  dependencies = ["fastmcp>=2.9.2"]
+name = "godot-mcp"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["fastmcp>=2.9.2"]
+
+[project.scripts]
+mcp = "godot_mcp.main:run_server"
+
+[tool.uv]
+package = true
