@@ -4,4 +4,4 @@
   description = "Add your description here"
   readme = "README.md"
   requires-python = ">=3.12"
-  dependencies = ["fastmcp>=2.9.2"]
+  dependencies = ["fastmcp>=2.13.1"]
