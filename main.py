@@ -7,7 +7,7 @@ from resources import config_mcp
 from tools import godot_mcp
 
 mcp = FastMCP(
-    name="MainMCP",
+    name="GodotEngineMCP",
     version="0.1.0",
     port=8000,
 )

@@ -1,10 +1,86 @@
 import json
 import os
+import re
 import subprocess
+from pathlib import Path
 
 from fastmcp import FastMCP
 
 from models.response import ContentItem, ToolResponse
+
+
+def _build_tree(path: Path, max_depth: int = -1):
+    """
+    Recursively build a nested dict structure of directories and files.
+    If max_depth >=0, limit recursion beyond that depth.
+    """
+    tree = {"name": path.name, "path": str(path), "type": "directory", "children": []}
+    if max_depth == 0:
+        return tree
+    try:
+        for entry in sorted(path.iterdir()):
+            if entry.name.startswith("."):
+                continue  # skip hidden
+            if entry.is_dir():
+                subtree = _build_tree(entry, max_depth - 1 if max_depth > 0 else -1)
+                tree["children"].append(subtree)
+            else:
+                tree["children"].append(
+                    {"name": entry.name, "path": str(entry), "type": "file"}
+                )
+    except Exception:
+        # you might want to log or skip
+        pass
+    return tree
+
+
+def _compute_project_structure_counts(project_path: str) -> dict:
+    """
+    Mirrors getProjectStructureAsync from index.ts:
+    Recursively walk the project and count scenes, scripts, assets, and other files.
+    - scenes: .tscn
+    - scripts: .gd, .gdscript, .cs
+    - assets: png, jpg, jpeg, webp, svg, ttf, wav, mp3, ogg
+    - other: everything else
+    """
+    structure = {
+        "scenes": 0,
+        "scripts": 0,
+        "assets": 0,
+        "other": 0,
+    }
+
+    for root, dirs, files in os.walk(project_path):
+        # Skip hidden directories
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+
+        for filename in files:
+            # Skip hidden files
+            if filename.startswith("."):
+                continue
+
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+            if ext == "tscn":
+                structure["scenes"] += 1
+            elif ext in ("gd", "gdscript", "cs"):
+                structure["scripts"] += 1
+            elif ext in (
+                "png",
+                "jpg",
+                "jpeg",
+                "webp",
+                "svg",
+                "ttf",
+                "wav",
+                "mp3",
+                "ogg",
+            ):
+                structure["assets"] += 1
+            else:
+                structure["other"] += 1
+
+    return structure
 
 
 def register_project_tools(mcp: FastMCP):
@@ -249,3 +325,191 @@ def register_project_tools(mcp: FastMCP):
     ) -> str:
         """Resave all resources in the project to update UID references and generate missing UIDs."""
         raise NotImplementedError("resave_resources tool is not implemented yet.")
+
+    @mcp.tool
+    def get_project_structure(directory: str, max_depth: int = -1):
+        """Return the directory tree structure starting from `directory`."""
+        if not directory:
+            resp = ToolResponse(
+                content=[ContentItem(type="text", text="Directory path is required.")],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        # Simple path-traversal guard; you may tighten this
+        if ".." in directory:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text="Invalid directory path: path traversal not allowed.",
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        root = Path(directory)
+        if not root.exists():
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text", text=f"Directory does not exist: {directory}"
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        tree = _build_tree(root, max_depth=max_depth)
+        resp = ToolResponse(
+            content=[ContentItem(type="json", text=json.dumps(tree, indent=2))],
+        )
+        return resp.model_dump(by_alias=True)
+
+    @mcp.tool
+    def get_project_info(project_path: str):
+        """
+        Get high-level info about a Godot project, similar to handleGetProjectInfo in index.ts.
+
+        Returns JSON text with:
+        - name: project name (from config/name in project.godot if available, otherwise directory name)
+        - path: project path
+        - godotVersion: output of `godot --version`
+        - structure: counts of scenes, scripts, assets, other
+        """
+        # Basic validation
+        if not project_path:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text="Project path is required.\n\nSuggestions:\n"
+                        "- Provide a valid path to a Godot project directory\n",
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        # Rough equivalent of validatePath in your TS (block "..")
+        if ".." in project_path:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text="Invalid project path.\n\nSuggestions:\n"
+                        "- Provide a valid path without '..' or other potentially unsafe characters\n",
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        project_file = os.path.join(project_path, "project.godot")
+        if not os.path.exists(project_file):
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=(
+                            f"Not a valid Godot project: {project_path}\n\n"
+                            "Suggestions:\n"
+                            "- Ensure the path points to a directory containing a project.godot file\n"
+                            "- Use list_projects to find valid Godot projects\n"
+                        ),
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        # Detect / choose Godot path – mirrors your this.godotPath + detectGodotPath idea
+        godot_path = os.environ.get("GODOT_PATH", "godot")
+
+        try:
+            # Get Godot version (like `"${this.godotPath}" --version`)
+            result = subprocess.run(
+                [godot_path, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+            )
+
+            if result.returncode != 0:
+                raise RuntimeError(
+                    result.stderr.strip() or "Failed to get Godot version"
+                )
+
+            godot_version = result.stdout.strip()
+        except Exception as e:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=(
+                            f"Could not find a valid Godot executable path or failed to run Godot: {e}\n\n"
+                            "Suggestions:\n"
+                            "- Ensure Godot is installed correctly\n"
+                            "- Set GODOT_PATH environment variable to specify the correct path\n"
+                        ),
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        try:
+            # Get project structure counts (async version in TS)
+            project_structure = _compute_project_structure_counts(project_path)
+
+            # Default project name is the directory name
+            project_name = os.path.basename(os.path.normpath(project_path))
+
+            # Try to extract config/name from project.godot, like the TS regex:
+            # const configNameMatch = projectFileContent.match(/config\/name="([^"]+)"/);
+            try:
+                with open(project_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+                match = re.search(r'config/name="([^"]+)"', content)
+                if match and match.group(1):
+                    project_name = match.group(1)
+            except Exception:
+                # If reading or regex fails, we just keep the directory name
+                pass
+
+            payload = {
+                "name": project_name,
+                "path": project_path,
+                "godotVersion": godot_version,
+                "structure": project_structure,
+            }
+
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=json.dumps(payload, indent=2),
+                    )
+                ]
+            )
+            return resp.model_dump(by_alias=True)
+
+        except Exception as e:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=(
+                            f"Failed to get project info: {e}\n\n"
+                            "Suggestions:\n"
+                            "- Ensure Godot is installed correctly\n"
+                            "- Check if the GODOT_PATH environment variable is set correctly\n"
+                            "- Verify the project path is accessible\n"
+                        ),
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
