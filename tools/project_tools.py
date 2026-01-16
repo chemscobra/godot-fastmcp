@@ -2,11 +2,68 @@ import json
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 
 from fastmcp import FastMCP
 
 from models.response import ContentItem, ToolResponse
+
+
+class ActiveProcessInfo:
+    def __init__(
+        self,
+        process: subprocess.Popen,
+        output: list[str],
+        errors: list[str],
+        output_lock: threading.Lock,
+        error_lock: threading.Lock,
+    ):
+        self.process = process
+        self.output = output
+        self.errors = errors
+        self.output_lock = output_lock
+        self.error_lock = error_lock
+
+
+_active_process: ActiveProcessInfo | None = None
+_active_process_lock = threading.Lock()
+
+
+def _capture_stream(stream, buffer: list[str], buffer_lock: threading.Lock):
+    try:
+        for line in iter(stream.readline, ""):
+            if not line:
+                break
+            with buffer_lock:
+                buffer.append(line.rstrip("\n"))
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _stop_active_process():
+    global _active_process
+    with _active_process_lock:
+        active = _active_process
+        _active_process = None
+
+    if not active:
+        return None
+
+    proc = active.process
+    if isinstance(proc, subprocess.Popen):
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        except Exception:
+            pass
+
+    return active
 
 
 def _build_tree(path: Path, max_depth: int = -1):
@@ -169,6 +226,216 @@ def register_project_tools(mcp: FastMCP):
             return resp.model_dump(by_alias=True)
 
     @mcp.tool
+    def run_project(project_path: str, scene: str | None = None):
+        """Run the Godot project and capture output."""
+        if not project_path:
+            resp = ToolResponse(
+                content=[ContentItem(type="text", text="Project path is required.")],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        if ".." in project_path or (scene and ".." in scene):
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text="Invalid project or scene path: path traversal is not allowed.",
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        project_file = os.path.join(project_path, "project.godot")
+        if not os.path.exists(project_file):
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=(
+                            f"Not a valid Godot project: {project_path}\n\n"
+                            "Suggestions:\n"
+                            "- Ensure the path points to a directory containing a project.godot file\n"
+                            "- Use list_projects to find valid Godot projects\n"
+                        ),
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        _stop_active_process()
+
+        godot_path = os.environ.get("GODOT_PATH", "godot")
+        cmd = [godot_path, "-d", "--path", project_path]
+        if scene:
+            cmd.append(scene)
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as e:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=(
+                            f"Failed to start Godot project: {e}\n\n"
+                            "Suggestions:\n"
+                            "- Ensure Godot is installed correctly\n"
+                            "- Check if the GODOT_PATH environment variable is set correctly\n"
+                            "- Verify the project path is accessible\n"
+                        ),
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        output: list[str] = []
+        errors: list[str] = []
+        output_lock = threading.Lock()
+        error_lock = threading.Lock()
+
+        if proc.stdout:
+            threading.Thread(
+                target=_capture_stream,
+                args=(proc.stdout, output, output_lock),
+                daemon=True,
+            ).start()
+        if proc.stderr:
+            threading.Thread(
+                target=_capture_stream,
+                args=(proc.stderr, errors, error_lock),
+                daemon=True,
+            ).start()
+
+        with _active_process_lock:
+            global _active_process
+            _active_process = ActiveProcessInfo(
+                process=proc,
+                output=output,
+                errors=errors,
+                output_lock=output_lock,
+                error_lock=error_lock,
+            )
+
+        resp = ToolResponse(
+            content=[
+                ContentItem(
+                    type="text",
+                    text=(
+                        "Godot project started in debug mode. "
+                        "Use get_debug_output to fetch runtime output."
+                    ),
+                )
+            ]
+        )
+        return resp.model_dump(by_alias=True)
+
+    @mcp.tool
+    def get_debug_output():
+        """Get the current debug output and errors from the active process."""
+        with _active_process_lock:
+            active = _active_process
+
+        if not active:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=(
+                            "No active Godot process.\n\n"
+                            "Suggestions:\n"
+                            "- Use run_project to start a project\n"
+                            "- Ensure the project did not exit unexpectedly\n"
+                        ),
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        output_lock = active.output_lock
+        error_lock = active.error_lock
+        output = active.output
+        errors = active.errors
+
+        with output_lock:
+            output_snapshot = list(output)
+
+        with error_lock:
+            error_snapshot = list(errors)
+
+        payload = {
+            "output": output_snapshot,
+            "errors": error_snapshot,
+        }
+
+        resp = ToolResponse(
+            content=[
+                ContentItem(
+                    type="text",
+                    text=json.dumps(payload, indent=2),
+                )
+            ]
+        )
+        return resp.model_dump(by_alias=True)
+
+    @mcp.tool
+    def stop_project():
+        """Stop the currently running Godot project."""
+        active = _stop_active_process()
+        if not active:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=(
+                            "No active Godot process to stop.\n\n"
+                            "Suggestions:\n"
+                            "- Use run_project to start a project\n"
+                            "- The process may have already terminated\n"
+                        ),
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        output = active.output
+        errors = active.errors
+        output_lock = active.output_lock
+        error_lock = active.error_lock
+
+        with output_lock:
+            output_snapshot = list(output)
+
+        with error_lock:
+            error_snapshot = list(errors)
+
+        payload = {
+            "message": "Godot project stopped",
+            "finalOutput": output_snapshot,
+            "finalErrors": error_snapshot,
+        }
+
+        resp = ToolResponse(
+            content=[
+                ContentItem(
+                    type="text",
+                    text=json.dumps(payload, indent=2),
+                )
+            ]
+        )
+        return resp.model_dump(by_alias=True)
+
+    @mcp.tool
     def list_projects(directory: str, recursive: bool = False):
         """List Godot projects in a directory.
 
@@ -315,21 +582,224 @@ def register_project_tools(mcp: FastMCP):
     def get_uid(
         project_path: str,
         file_path: str,
-    ) -> str:
+    ):
         """Get the UID for a specific file (scene, script, or shader)."""
-        raise NotImplementedError("get_uid tool is not implemented yet.")
+        if not project_path or not file_path:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text="project_path and file_path are required.",
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        if ".." in project_path or ".." in file_path:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text="Invalid path: path traversal is not allowed.",
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        project_file = os.path.join(project_path, "project.godot")
+        if not os.path.exists(project_file):
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=(
+                            f"Not a valid Godot project: {project_path}\n\n"
+                            "Suggestions:\n"
+                            "- Ensure the path points to a directory containing a project.godot file\n"
+                            "- Use list_projects to find valid Godot projects\n"
+                        ),
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        godot_path = os.environ.get("GODOT_PATH", "godot")
+        operations_script = os.environ.get(
+            "GODOT_OPERATIONS_SCRIPT", "gd_scripts/godot_operations.gd"
+        )
+
+        params = {"file_path": file_path}
+        cmd = [
+            godot_path,
+            "--headless",
+            "--path",
+            project_path,
+            "--script",
+            operations_script,
+            "get_uid",
+            json.dumps(params),
+        ]
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            resp = ToolResponse(
+                content=[ContentItem(type="text", text=f"Failed to run Godot: {e}")],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        stdout_text = proc.stdout.strip() if proc.stdout else ""
+        stderr_text = proc.stderr.strip() if proc.stderr else ""
+
+        if proc.returncode != 0:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=(
+                            f"Failed to get UID: {stderr_text or 'Unknown error'}\n\n"
+                            "Suggestions:\n"
+                            "- Ensure the file exists inside the project\n"
+                            "- Check that GODOT_PATH and GODOT_OPERATIONS_SCRIPT are set correctly\n"
+                            "- Use resave_resources to generate missing UIDs\n"
+                        ),
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        resp = ToolResponse(
+            content=[
+                ContentItem(
+                    type="text",
+                    text=stdout_text or "UID lookup completed.",
+                )
+            ]
+        )
+        return resp.model_dump(by_alias=True)
 
     @mcp.tool
     def resave_resources(
         project_path: str,
-    ) -> str:
+    ):
         """Resave all resources in the project to update UID references and generate missing UIDs."""
-        raise NotImplementedError("resave_resources tool is not implemented yet.")
+        return _update_project_uids(project_path)
 
     @mcp.tool
-    def get_project_structure(directory: str, max_depth: int = -1):
-        """Return the directory tree structure starting from `directory`."""
-        if not directory:
+    def update_project_uids(
+        project_path: str,
+    ):
+        """Update UID references in a Godot project by resaving resources."""
+        return _update_project_uids(project_path)
+
+    def _update_project_uids(project_path: str):
+        if not project_path:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text="project_path is required.",
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        if ".." in project_path:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text="Invalid project path: path traversal is not allowed.",
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        project_file = os.path.join(project_path, "project.godot")
+        if not os.path.exists(project_file):
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=(
+                            f"Not a valid Godot project: {project_path}\n\n"
+                            "Suggestions:\n"
+                            "- Ensure the path points to a directory containing a project.godot file\n"
+                            "- Use list_projects to find valid Godot projects\n"
+                        ),
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        godot_path = os.environ.get("GODOT_PATH", "godot")
+        operations_script = os.environ.get(
+            "GODOT_OPERATIONS_SCRIPT", "gd_scripts/godot_operations.gd"
+        )
+
+        params = {"project_path": project_path}
+        cmd = [
+            godot_path,
+            "--headless",
+            "--path",
+            project_path,
+            "--script",
+            operations_script,
+            "resave_resources",
+            json.dumps(params),
+        ]
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except Exception as e:
+            resp = ToolResponse(
+                content=[ContentItem(type="text", text=f"Failed to run Godot: {e}")],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        stdout_text = proc.stdout.strip() if proc.stdout else ""
+        stderr_text = proc.stderr.strip() if proc.stderr else ""
+
+        if proc.returncode != 0:
+            resp = ToolResponse(
+                content=[
+                    ContentItem(
+                        type="text",
+                        text=(
+                            f"Failed to resave resources: {stderr_text or 'Unknown error'}\n\n"
+                            "Suggestions:\n"
+                            "- Ensure the project is accessible and writable\n"
+                            "- Check that GODOT_PATH and GODOT_OPERATIONS_SCRIPT are set correctly\n"
+                        ),
+                    )
+                ],
+                is_error=True,
+            )
+            return resp.model_dump(by_alias=True)
+
+        resp = ToolResponse(
+            content=[
+                ContentItem(
+                    type="text",
+                    text=stdout_text or "Resave operation completed.",
+                )
+            ]
+        )
+        return resp.model_dump(by_alias=True)
+
+    @mcp.tool
+    def get_project_structure(project_path: str, max_depth: int = -1):
+        """Return the directory tree structure starting from `project_path`."""
+        if not project_path:
             resp = ToolResponse(
                 content=[ContentItem(type="text", text="Directory path is required.")],
                 is_error=True,
@@ -337,7 +807,7 @@ def register_project_tools(mcp: FastMCP):
             return resp.model_dump(by_alias=True)
 
         # Simple path-traversal guard; you may tighten this
-        if ".." in directory:
+        if ".." in project_path:
             resp = ToolResponse(
                 content=[
                     ContentItem(
@@ -349,12 +819,12 @@ def register_project_tools(mcp: FastMCP):
             )
             return resp.model_dump(by_alias=True)
 
-        root = Path(directory)
+        root = Path(project_path)
         if not root.exists():
             resp = ToolResponse(
                 content=[
                     ContentItem(
-                        type="text", text=f"Directory does not exist: {directory}"
+                        type="text", text=f"Directory does not exist: {project_path}"
                     )
                 ],
                 is_error=True,

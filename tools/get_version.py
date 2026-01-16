@@ -10,6 +10,14 @@ def register_get_version(mcp):
     @mcp.tool
     def get_version():
         """Return the version string of the Godot executable."""
+        return _get_version_response()
+
+    @mcp.tool
+    def get_godot_version():
+        """Return the version string of the Godot executable."""
+        return _get_version_response()
+
+    def _get_version_response():
         godot_path = os.environ.get("GODOT_PATH", "godot")
         try:
             result = subprocess.run(

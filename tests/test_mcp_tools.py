@@ -276,7 +276,7 @@ class TestGetProjectInfo:
         assert "structure" in text_content
 
         # Check project name is correctly extracted
-        assert dict_content["name"] == "test_project"
+        assert dict_content["name"] == "Test Project"
         assert "/tmp" in dict_content["path"]
         assert "test_project" in dict_content["path"]
 
@@ -371,7 +371,7 @@ class TestGetProjectStructure:
     async def test_get_project_structure_basic(self, mcp_client, temp_godot_project):
         """Test getting project structure."""
         result: CallToolResult = await mcp_client.call_tool(
-            "get_project_structure", {"directory": temp_godot_project}
+            "get_project_structure", {"project_path": temp_godot_project}
         )
 
         assert result is not None
@@ -405,7 +405,8 @@ class TestGetProjectStructure:
     ):
         """Test getting project structure with max depth limit."""
         result: CallToolResult = await mcp_client.call_tool(
-            "get_project_structure", {"directory": temp_godot_project, "max_depth": 1}
+            "get_project_structure",
+            {"project_path": temp_godot_project, "max_depth": 1},
         )
 
         assert result is not None
@@ -430,7 +431,8 @@ class TestGetProjectStructure:
     ):
         """Test getting project structure with zero depth."""
         result: CallToolResult = await mcp_client.call_tool(
-            "get_project_structure", {"directory": temp_godot_project, "max_depth": 0}
+            "get_project_structure",
+            {"project_path": temp_godot_project, "max_depth": 0},
         )
 
         assert result is not None
@@ -448,7 +450,7 @@ class TestGetProjectStructure:
     async def test_get_project_structure_invalid_path(self, mcp_client):
         """Test getting structure with invalid path."""
         result: CallToolResult = await mcp_client.call_tool(
-            "get_project_structure", {"directory": "/nonexistent/path/xyz123"}
+            "get_project_structure", {"project_path": "/nonexistent/path/xyz123"}
         )
 
         data = result.data
@@ -461,7 +463,7 @@ class TestGetProjectStructure:
     async def test_get_project_structure_path_traversal(self, mcp_client):
         """Test that path traversal is blocked."""
         result: CallToolResult = await mcp_client.call_tool(
-            "get_project_structure", {"directory": "/tmp/../etc"}
+            "get_project_structure", {"project_path": "/tmp/../etc"}
         )
 
         data = result.data
@@ -517,3 +519,96 @@ class TestLaunchEditor:
 
     # Note: We don't test actual editor launch as it would spawn a GUI process
     # and is not suitable for automated testing
+
+
+@pytest.mark.integration
+class TestGetGodotVersionAlias:
+    """Tests for get_godot_version tool alias."""
+
+    @pytest.mark.asyncio
+    async def test_get_godot_version(self, mcp_client):
+        result: CallToolResult = await mcp_client.call_tool("get_godot_version", {})
+
+        assert result is not None
+        assert result.is_error is False
+
+        data = result.data
+        text_content = data["content"][0]["text"]
+        assert len(text_content) > 0
+
+
+@pytest.mark.integration
+class TestUpdateProjectUidsAlias:
+    """Tests for update_project_uids tool alias."""
+
+    @pytest.mark.asyncio
+    async def test_update_project_uids_path_traversal(self, mcp_client):
+        result: CallToolResult = await mcp_client.call_tool(
+            "update_project_uids", {"project_path": "/tmp/../etc"}
+        )
+
+        data = result.data
+        text_content = data["content"][0]["text"]
+
+        assert data["is_error"] is True
+        assert "path traversal" in text_content.lower()
+
+
+@pytest.mark.integration
+class TestRunProject:
+    """Tests for run_project tool."""
+
+    @pytest.mark.asyncio
+    async def test_run_project_invalid_project(self, mcp_client):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result: CallToolResult = await mcp_client.call_tool(
+                "run_project", {"project_path": tmpdir}
+            )
+
+            data = result.data
+            text_content = data["content"][0]["text"]
+
+            assert data["is_error"] is True
+            assert "not a valid godot project" in text_content.lower()
+
+    @pytest.mark.asyncio
+    async def test_run_project_path_traversal(self, mcp_client):
+        result: CallToolResult = await mcp_client.call_tool(
+            "run_project", {"project_path": "/tmp/../etc"}
+        )
+
+        data = result.data
+        text_content = data["content"][0]["text"]
+
+        assert data["is_error"] is True
+        assert "path traversal" in text_content.lower()
+
+
+@pytest.mark.integration
+class TestGetDebugOutput:
+    """Tests for get_debug_output tool."""
+
+    @pytest.mark.asyncio
+    async def test_get_debug_output_no_process(self, mcp_client):
+        result: CallToolResult = await mcp_client.call_tool("get_debug_output", {})
+
+        data = result.data
+        text_content = data["content"][0]["text"]
+
+        assert data["is_error"] is True
+        assert "no active godot process" in text_content.lower()
+
+
+@pytest.mark.integration
+class TestStopProject:
+    """Tests for stop_project tool."""
+
+    @pytest.mark.asyncio
+    async def test_stop_project_no_process(self, mcp_client):
+        result: CallToolResult = await mcp_client.call_tool("stop_project", {})
+
+        data = result.data
+        text_content = data["content"][0]["text"]
+
+        assert data["is_error"] is True
+        assert "no active godot process" in text_content.lower()
